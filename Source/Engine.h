@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <vector>
@@ -120,51 +121,57 @@ private:
 };
 
 //==============================================================================
-// A track = a looping MIDI clip + a fixed serial device chain (Synth -> Filter -> Out).
-// Exposed to the host graph as a regular AudioProcessor so a VST3/AU insert can follow it.
+// A track = a step pattern (piano roll data) + a fixed serial device chain
+// (Synth -> Filter -> Out). Exposed to the host graph as a regular AudioProcessor
+// so a VST3/AU insert can follow it.
 class TrackProcessor : public juce::AudioProcessor
 {
 public:
-    struct Note { double startBeat, lengthBeat; int note; };
+    //--------------------------------------------------------------------------
+    // Piano-roll data: a grid of atomic cells. The UI thread writes, the audio
+    // thread reads; no locks, no allocation, no shared containers.
+    struct Pattern
+    {
+        static constexpr int numSteps = 16;   // 16 sixteenth-notes = 1 bar of 4/4
+        static constexpr int numRows  = 24;   // 2 octaves above baseNote
 
-    TrackProcessor (Transport& t, juce::String name, SynthDevice::Wave wave,
-                    std::vector<Note> clipNotes, double clipBeats)
+        Pattern() { for (auto& c : cells) c.store (0); }
+
+        bool get (int row, int step) const { return cells[(size_t) (step * numRows + row)].load (std::memory_order_relaxed) != 0; }
+        void set (int row, int step, bool on) { cells[(size_t) (step * numRows + row)].store (on ? 1 : 0, std::memory_order_relaxed); }
+
+    private:
+        std::array<std::atomic<juce::uint8>, (size_t) (numSteps * numRows)> cells;
+    };
+
+    TrackProcessor (Transport& t, juce::String name, SynthDevice::Wave wave, int baseNoteIn)
         : AudioProcessor (BusesProperties().withOutput ("Out", juce::AudioChannelSet::stereo(), true)),
-          transport (t), trackName (std::move (name)),
-          notes (std::move (clipNotes)), clipLengthBeats (clipBeats)
+          transport (t), trackName (std::move (name)), baseNote (baseNoteIn)
     {
         auto f = std::make_unique<FilterDevice>();
-        auto o = std::make_unique<OutputDevice>();
         filter = f.get();
-        output = o.get();
         chain.push_back (std::make_unique<SynthDevice> (wave));
         chain.push_back (std::move (f));
-        chain.push_back (std::move (o));
+        chain.push_back (std::make_unique<OutputDevice>());
     }
 
-    FilterDevice& getFilter() { return *filter; }
+    FilterDevice& getFilter()      { return *filter; }
+    Pattern&      getPattern()     { return pattern; }
+    int           getBaseNote() const { return baseNote; }
+    int           getCurrentStep() const { return currentStep.load (std::memory_order_relaxed); }   // -1 = stopped
 
     //--------------------------------------------------------------------------
     void prepareToPlay (double sr, int maxBlock) override
     {
         // Message/prepare thread: allocate everything here.
-        const double samplesPerBeat = sr * 60.0 / bpm;
-        loopLen = std::max<juce::int64> (1, (juce::int64) (clipLengthBeats * samplesPerBeat));
-
-        events.clear();
-        events.reserve (notes.size() * 2);
-        for (auto& n : notes)
-        {
-            const auto on  = (juce::int64) (n.startBeat * samplesPerBeat);
-            const auto off = juce::jmin (loopLen - 1, on + (juce::int64) (n.lengthBeat * samplesPerBeat));
-            events.push_back ({ on,  n.note, true  });
-            events.push_back ({ off, n.note, false });
-        }
+        stepLen = std::max<juce::int64> (1, (juce::int64) (sr * 60.0 / bpm / 4.0));
+        loopLen = stepLen * Pattern::numSteps;
 
         clipMidi.ensureSize (2048);
         for (auto& d : chain) d->prepare (sr, maxBlock);
         pos = 0;
         wasPlaying = false;
+        currentStep.store (-1);
     }
 
     void releaseResources() override {}
@@ -186,24 +193,39 @@ public:
                 pos = 0;
                 for (auto& d : chain) d->reset();
             }
+            currentStep.store (-1, std::memory_order_relaxed);
             return;
         }
         wasPlaying = true;
 
-        // --- clip playback: turn clip notes into sample-accurate MIDI for this block
+        // --- pattern playback: scan the grid for steps that start/end inside this block
         const int n = buffer.getNumSamples();
         const juce::int64 start = pos % loopLen;
         clipMidi.clear();
 
-        for (const auto& e : events)
+        auto inBlock = [&] (juce::int64 t, int& samplePos)
         {
-            juce::int64 t = e.time;
             if (t < start) t += loopLen;                      // wrapped into this block?
-            if (t >= start && t < start + n)
-                clipMidi.addEvent (e.on ? juce::MidiMessage::noteOn  (1, e.note, (juce::uint8) 100)
-                                        : juce::MidiMessage::noteOff (1, e.note),
-                                   (int) (t - start));
+            if (t >= start && t < start + n) { samplePos = (int) (t - start); return true; }
+            return false;
+        };
+
+        for (int s = 0; s < Pattern::numSteps; ++s)
+        {
+            const juce::int64 onT  = s * stepLen;
+            const juce::int64 offT = onT + (stepLen * 9) / 10;   // 90% gate
+            int p = 0;
+
+            if (inBlock (offT, p))
+                clipMidi.addEvent (juce::MidiMessage::allNotesOff (1), p);
+
+            if (inBlock (onT, p))
+                for (int r = 0; r < Pattern::numRows; ++r)
+                    if (pattern.get (r, s))
+                        clipMidi.addEvent (juce::MidiMessage::noteOn (1, baseNote + r, (juce::uint8) 100), p);
         }
+
+        currentStep.store ((int) (start / stepLen), std::memory_order_relaxed);
 
         // --- serial device chain
         for (auto& d : chain) d->process (buffer, clipMidi);
@@ -233,20 +255,18 @@ public:
     }
 
 private:
-    struct Event { juce::int64 time; int note; bool on; };
-
     Transport& transport;
     juce::String trackName;
-    std::vector<Note> notes;          // immutable after construction
-    double clipLengthBeats;
+    const int baseNote;
     const double bpm = 120.0;
 
-    std::vector<Event> events;        // built in prepareToPlay, read-only on audio thread
+    Pattern pattern;
+    std::atomic<int> currentStep { -1 };
+
     juce::MidiBuffer clipMidi;
     std::vector<std::unique_ptr<Device>> chain;
     FilterDevice* filter = nullptr;
-    OutputDevice* output = nullptr;
 
-    juce::int64 pos = 0, loopLen = 1; // audio-thread only
-    bool wasPlaying = false;          // audio-thread only
+    juce::int64 stepLen = 1, loopLen = 1, pos = 0;   // audio-thread only (after prepare)
+    bool wasPlaying = false;                          // audio-thread only
 };

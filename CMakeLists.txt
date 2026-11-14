@@ -18,7 +18,8 @@ target_sources(MiniDAW PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp
     Source/MainComponent.h
-    Source/Engine.h)
+    Source/Engine.h
+    Source/PianoRoll.h)
 
 target_compile_definitions(MiniDAW PRIVATE
     JUCE_WEB_BROWSER=0

@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "Engine.h"
+#include "PianoRoll.h"
 
 class MainComponent : public juce::Component
 {
@@ -17,12 +18,13 @@ private:
         juce::Label nameLabel, chainLabel;
         juce::Slider cutoff;
         juce::TextButton loadVst { "Load VST" };
+        std::unique_ptr<PianoRoll> roll;
         TrackProcessor* proc = nullptr;                       // owned by graph
         juce::AudioProcessorGraph::Node::Ptr trackNode, pluginNode;
     };
 
-    void addTrack (const juce::String& name, SynthDevice::Wave wave,
-                   std::vector<TrackProcessor::Note> notes, double beats);
+    void addTrack (const juce::String& name, SynthDevice::Wave wave, int baseNote,
+                   const std::vector<std::pair<int, int>>& seedCells);   // (row, step)
     void rewire (TrackRow&);
     void chooseAndLoadPlugin (TrackRow&);
 

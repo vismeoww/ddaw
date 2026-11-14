@@ -1,7 +1,12 @@
 #include "MainComponent.h"
 
 using Wave = SynthDevice::Wave;
-using Note = TrackProcessor::Note;
+
+namespace
+{
+    constexpr int kTopH = 60, kHeaderH = 80, kRollH = 192, kGap = 8;
+    constexpr int kTrackH = kHeaderH + kRollH + kGap;
+}
 
 MainComponent::MainComponent()
 {
@@ -20,10 +25,11 @@ MainComponent::MainComponent()
     outNode = graph.addNode (std::make_unique<juce::AudioProcessorGraph::AudioGraphIOProcessor> (
                   juce::AudioProcessorGraph::AudioGraphIOProcessor::audioOutputNode));
 
-    addTrack ("Lead", Wave::saw,    { { 0, 0.8, 60 }, { 1, 0.8, 64 }, { 2, 0.8, 67 }, { 3, 0.8, 72 } }, 4.0);
-    addTrack ("Bass", Wave::square, { { 0, 1.8, 36 }, { 2, 1.8, 43 } }, 4.0);
+    // seed cells are (row above baseNote, step)
+    addTrack ("Lead", Wave::saw,    60, { { 0, 0 }, { 4, 4 }, { 7, 8 }, { 12, 12 } });
+    addTrack ("Bass", Wave::square, 36, { { 0, 0 }, { 0, 6 }, { 7, 8 }, { 5, 12 } });
 
-    setSize (720, 60 + 90 * (int) rows.size());
+    setSize (720, kTopH + kTrackH * (int) rows.size() + 10);
 }
 
 MainComponent::~MainComponent()
@@ -32,10 +38,13 @@ MainComponent::~MainComponent()
     player.setProcessor (nullptr);
 }
 
-void MainComponent::addTrack (const juce::String& name, Wave wave, std::vector<Note> notes, double beats)
+void MainComponent::addTrack (const juce::String& name, Wave wave, int baseNote,
+                              const std::vector<std::pair<int, int>>& seedCells)
 {
     auto row = std::make_unique<TrackRow>();
-    auto proc = std::make_unique<TrackProcessor> (transport, name, wave, std::move (notes), beats);
+    auto proc = std::make_unique<TrackProcessor> (transport, name, wave, baseNote);
+    for (auto [r, s] : seedCells)
+        proc->getPattern().set (r, s, true);
     row->proc = proc.get();
     row->trackNode = graph.addNode (std::move (proc));
 
@@ -58,6 +67,9 @@ void MainComponent::addTrack (const juce::String& name, Wave wave, std::vector<N
     addAndMakeVisible (row->chainLabel);
     addAndMakeVisible (row->cutoff);
     addAndMakeVisible (row->loadVst);
+
+    row->roll = std::make_unique<PianoRoll> (*row->proc);
+    addAndMakeVisible (*row->roll);
 
     rewire (*row);
     rows.push_back (std::move (row));
@@ -138,7 +150,7 @@ void MainComponent::paint (juce::Graphics& g)
     g.fillAll (getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId));
     g.setColour (juce::Colours::white.withAlpha (0.15f));
     for (size_t i = 0; i < rows.size(); ++i)
-        g.drawHorizontalLine (60 + 90 * (int) i, 0.0f, (float) getWidth());
+        g.drawHorizontalLine (kTopH + kTrackH * (int) i, 0.0f, (float) getWidth());
 }
 
 void MainComponent::resized()
@@ -152,12 +164,14 @@ void MainComponent::resized()
 
     for (auto& r : rows)
     {
-        auto row = area.removeFromTop (90).reduced (0, 5);
-        r->nameLabel.setBounds (row.removeFromLeft (70).removeFromTop (30));
-        auto right = row.removeFromRight (100);
-        r->loadVst.setBounds (right.removeFromTop (30));
-        auto top2 = row.removeFromTop (30);
-        r->cutoff.setBounds (top2);
-        r->chainLabel.setBounds (row);
+        auto row = area.removeFromTop (kTrackH);
+        row.removeFromBottom (kGap);
+        auto header = row.removeFromTop (kHeaderH).reduced (0, 5);
+
+        r->nameLabel.setBounds (header.removeFromLeft (70).removeFromTop (30));
+        r->loadVst.setBounds (header.removeFromRight (100).removeFromTop (30));
+        r->cutoff.setBounds (header.removeFromTop (30));
+        r->chainLabel.setBounds (header);
+        r->roll->setBounds (row);
     }
 }
